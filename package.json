@@ -1,38 +1,10 @@
 {
-  "name": "shareopen-workbuddy-sidecar",
-  "version": "1.0.3",
+  "name": "shareopen-sidecar",
+  "version": "1.2.3",
   "type": "module",
-  "description": "ShareOpen sidecar (self-contained: SDK inlined, ws bundled).",
+  "private": true,
+  "description": "ShareOpen <NAME> sidecar — self-contained (SDK inlined, ws bundled).",
   "bin": {
-    "so-workbuddy-sidecar": "index.js",
     "so-sidecar": "index.js"
-  },
-  "main": "index.js",
-  "files": [
-    "index.js",
-    "builtin-commands.js",
-    "sdk/",
-    "README.md"
-  ],
-  "license": "MIT",
-  "publishConfig": {
-    "registry": "https://registry.npmjs.org/"
-  },
-  "private": false,
-  "keywords": [
-    "shareopen",
-    "workbuddy",
-    "openclaw",
-    "sidecar",
-    "agent",
-    "ai"
-  ],
-  "homepage": "https://shareopen.com",
-  "repository": {
-    "type": "git",
-    "url": "https://github.com/steveveivo/shareopen-workbuddy-sidecar"
-  },
-  "dependencies": {
-    "ws": "^8.18.0"
   }
 }

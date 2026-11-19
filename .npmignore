@@ -1,0 +1,10 @@
+# 只打包侧车本体, 排除运行时污染
+convs/
+.so-media/
+*.bak
+index.js.bak
+shareopen-sidecar-*.tgz
+test.pdf
+test_attachment.pdf
+npm-debug.log*
+*.log

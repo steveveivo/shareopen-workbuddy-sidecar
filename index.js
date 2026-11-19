@@ -29,8 +29,8 @@
  *      queue in the backend (existing /ws/agent behavior).
  */
 
-import { ShareOpenConnector } from './sdk/index.js'
-import { handleCommand, registerBuiltins } from './builtin-commands.js'
+import { ShareOpenConnector } from '../../sdk/node/index.js'
+import { handleCommand, registerBuiltins } from '../builtin-commands.js'
 import { spawn } from 'node:child_process'
 import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
@@ -42,7 +42,7 @@ const args = parseArgs(process.argv.slice(3))
 const agentId = args['agent-id'] || process.env.WB_AGENT_ID || ''
 const soToken = args.token || process.env.SO_AGENT_TOKEN || ''
 const shareopen = args.shareopen || process.env.SHAREOPEN_URL || 'http://localhost:3021'
-const workdir = args['workdir'] || process.cwd()
+const workdir = args['workdir'] || join(process.env.HOME || '', '.workbuddy') // [2026-11-18] 默认指向 WorkBuddy 底座目录, 不用 shareopen connector 文件夹
 const WB_APP_CLI = '/Applications/WorkBuddy AI.app/Contents/Resources/app.asar.unpacked/cli'
 // Bin resolution (2026-09-30): the native standalone CLI (`codebuddy install`,
 // → ~/.local/bin/codebuddy, OAuth login) is the supported path; fall back to
@@ -139,12 +139,21 @@ async function serve() {
     console.log(`[workbuddy-sidecar] user msg in ${convId}: ${prompt.slice(0, 60)}…`)
 
     await sdk.typing(convId, true)
-    const result = await runCodebuddyHeadless(prompt, workdir, convId, SESSION_BY_CONV.get(convId))
+    // [align 2026-11-17] 工具执行进度 → progress_update 帧 (对齐 codex/claude 进度条)
+    const onProgress = (tool) => {
+      console.log(`[workbuddy-sidecar] progress ${convId}: tool ${tool}`)
+      sdk.progress(convId, `[workbuddy] 执行 ${tool || '工具'}`, 'in_progress').catch(() => {})
+    }
+    const result = await runCodebuddyHeadless(prompt, workdir, convId, SESSION_BY_CONV.get(convId), onProgress)
     await sdk.typing(convId, false)
     if (mediaDir) { try { await rm(mediaDir, { recursive: true, force: true }) } catch {} }
 
     if (result.error) {
       await sdk.send(convId, `[workbuddy error] ${result.error}`)
+    } else if (result.chunks) {
+      // [P0 2026-11-16] 真流式: 文本增量经生成器流式推送 (打字机效果),
+      // sdk.stream 内部收尾为 final agent_message. 无出站附件, 纯文本安全.
+      await sdk.stream(convId, result.chunks, { finalFallback: result.text || '(no output)' })
     } else {
       await sdk.send(convId, result.text || '(no output)')
     }
@@ -170,8 +179,8 @@ async function serve() {
  * Run `codebuddy -p <prompt>` headlessly and capture the JSON output.
  * Returns { text, sessionId?, error? }.
  */
-function runCodebuddyHeadless(prompt, cwd, convId, resumeSession) {
-  const outArgs = ['-p', prompt, '--output-format', 'json', '-y']
+function runCodebuddyHeadless(prompt, cwd, convId, resumeSession, onProgress) {
+  const outArgs = ['-p', prompt, '--output-format', 'stream-json', '--verbose', '-y']
   if (resumeSession) outArgs.push('--resume', resumeSession)
   console.log(`[workbuddy-sidecar] spawn codebuddy (resume=${resumeSession || 'none'})`)
 
@@ -186,53 +195,104 @@ function runCodebuddyHeadless(prompt, cwd, convId, resumeSession) {
 
     let stdout = ''
     let stderr = ''
-    proc.stdout.on('data', (d) => (stdout += d))
+    // [P0 2026-11-16] 真流式: 累积 stream-json 文本增量 → chunks 队列;
+    // 同时抓 session_id (从 result/session 事件) 供 resume 复用.
+    const chunkQueue = []
+    let chunkWaiter = null
+    let done = false
+    const fullText = { v: '' }
+    let capturedSessionId = null
+    const PACE_CHARS = 5
+    const PACE_MS = 50
+    const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+    // [P0 2026-11-17 fix] 打字机节奏放消费侧(yield 间 sleep), 生产侧只入队+唤醒
+    const enqueue = (t) => {
+      if (!t) return
+      fullText.v += t
+      chunkQueue.push(t)
+      if (chunkWaiter) { const w = chunkWaiter; chunkWaiter = null; w() }
+    }
+    proc.stdout.on('data', (d) => {
+      stdout += d
+      const lines = stdout.split('\n')
+      stdout = lines.pop() || ''
+      for (const line of lines) {
+        if (!line.trim()) continue
+        try {
+          const ev = JSON.parse(line)
+          if (ev.session_id) capturedSessionId = ev.session_id
+          // CodeBuddy stream-json: assistant 文本增量
+          if (ev.type === 'assistant' && ev.message && Array.isArray(ev.message.content)) {
+            for (const c of ev.message.content) {
+              if (c && c.type === 'text' && c.text) enqueue(c.text)
+              // [align 2026-11-17] tool_use 事件 → 进度帧 (对齐 codex/claude):
+              else if (c && c.type === 'tool_use') onProgress?.(c.name)
+            }
+          } else if (ev.type === 'result' && ev.result !== undefined && ev.result !== null) {
+            if (!fullText.v) enqueue(String(ev.result))
+            if (ev.is_error) return
+            if (ev.session_id) capturedSessionId = ev.session_id
+          }
+        } catch (_) {}
+      }
+    })
     proc.stderr.on('data', (d) => (stderr += d))
 
-    proc.on('close', (code) => {
+    proc.on('close', async (code) => {
       if (code !== 0) {
         return resolve({ error: stderr.slice(0, 500) || `codebuddy exited ${code}` })
       }
-      // [fix 2026-10-01] --resume 失效时 codebuddy 静默降级: exit 0, stdout 空,
-      // stderr 提示 "No conversation found with session ID" (session 过期/丢失).
-      // 旧代码只查 code, 空 stdout 被当正常输出 → 推送 '(no output)' 空气泡.
-      // 现在: stdout 空/非 JSON 且 stderr 有内容 → 当错误上抛 (让调用方重发新会话).
-      if (!String(stdout || '').trim()) {
+      // [P0 2026-11-16] session_id 从流式事件抓; 兜底从 close 后全量 stdout (JSONL 拼回) 再试.
+      let sessionId = capturedSessionId
+      if (!sessionId && String(stdout || '').trim()) {
+        try {
+          const parsed = JSON.parse(stdout)
+          const term = Array.isArray(parsed) ? [...parsed].reverse().find((m) => m && m.result !== undefined) : parsed
+          sessionId = term?.session_id || null
+        } catch (_) {
+          // stream-json: stdout 是多行 JSONL, 逐行找 session_id
+          for (const l of String(stdout).split('\n')) {
+            if (!l.trim()) continue
+            try { const o = JSON.parse(l); if (o.session_id) { sessionId = o.session_id; break } } catch (_) {}
+          }
+        }
+      }
+      if (sessionId && convId) { SESSION_BY_CONV.set(convId, sessionId); persistSessions() }
+
+      // [fix 2026-10-01] --resume 失效静默降级 / 空输出 兜底 (保留原逻辑).
+      // [P0 2026-11-17] 真降级: resume 失效(空输出)时, 去掉 --resume 重跑一次(无上下文首轮),
+      //   而不是直接报 produced no output. 仅当"无 resume 重跑"后仍空, 才报错.
+      if (!String(fullText.v || '').trim() && !String(stdout || '').trim()) {
+        if (resumeSession) {
+          console.warn(`[workbuddy-sidecar] resume=${resumeSession} produced no output → retry without --resume`)
+          SESSION_BY_CONV.delete(convId)
+          persistSessions()
+          const retry = await runCodebuddyHeadless(prompt, cwd, convId, null, onProgress)
+          return resolve(retry)
+        }
         if (String(stderr || '').trim()) {
           console.warn(`[workbuddy-sidecar] codebuddy empty stdout on resume=${resumeSession}: ${stderr.slice(0,200)}`)
           return resolve({ error: `codebuddy resume failed (${resumeSession}): ${String(stderr).slice(0,300)}` })
         }
-        // 真的空输出 (罕见, 非 resume 问题) → 明确报出而非空气泡
         return resolve({ error: 'codebuddy produced no output' })
       }
-      try {
-        const parsed = JSON.parse(stdout)
-        // CodeBuddy output contract (v2.160+, verified 2026-09-30):
-        // --output-format json returns a MESSAGE ARRAY; the terminal element
-        // carries { subtype:'success', is_error, result, session_id }.
-        // Older builds returned a flat { result, session_id } object.
-        const term = Array.isArray(parsed)
-          ? [...parsed].reverse().find((m) => m && m.result !== undefined)
-          : parsed
-        if (term?.session_id && convId) { SESSION_BY_CONV.set(convId, term.session_id); persistSessions() }
-        if (term?.is_error) {
-          return resolve({ error: String(term.result || 'codebuddy reported an error').slice(0, 500) })
+
+      done = true
+      if (chunkWaiter) { const w = chunkWaiter; chunkWaiter = null; w() }
+      const chunks = (async function* () {
+        let i = 0
+        while (i < chunkQueue.length || !done) {
+          while (i < chunkQueue.length) {
+            const t = chunkQueue[i++]
+            for (let p = 0; p < t.length; p += PACE_CHARS) {
+              yield t.slice(p, p + PACE_CHARS)
+              if (p + PACE_CHARS < t.length) await sleep(PACE_MS)
+            }
+          }
+          if (!done) await new Promise((r) => { chunkWaiter = r })
         }
-        // [fix 2026-10-01] resume 成功但 terminal.result 为 undefined (e.g. 会话
-        // 状态异常/截断): 旧代码回退到整段 stdout (JSON 原文) 当答案推送.
-        if (term?.result === undefined || term?.result === null) {
-          console.warn(`[workbuddy-sidecar] terminal result missing (resume=${resumeSession}), clearing stale session`)
-          SESSION_BY_CONV.delete(convId)
-          persistSessions()
-          return resolve({ error: 'codebuddy returned no final answer (stale session); please retry in a fresh conversation' })
-        }
-        resolve({ text: String(term.result) })
-      } catch (e) {
-        // [fix 2026-10-01] stdout 非 JSON (codebuddy 输出异常): 旧代码把整段
-        // stdout 原文当答案推. 现在: 若疑似 resume 静默降级, 上抛错误.
-        console.warn(`[workbuddy-sidecar] JSON parse failed: ${e.message}; stdout head: ${String(stdout).slice(0,150)}`)
-        resolve({ text: String(stdout) })
-      }
+      })()
+      resolve({ text: fullText.v || String(stdout), chunks })
     })
 
     proc.on('error', (e) => resolve({ error: e.message }))
